@@ -116,7 +116,7 @@ enum FormatAction: CaseIterable {
         case .image: return L("画像")
         case .horizontalRule: return L("水平線")
         case .newParagraph: return L("新しい段落")
-        case .copyHeadings: return L("見出しをコピー")
+        case .copyHeadings: return L("見出しのみをコピー")
         case .raiseHeadings: return L("すべての見出しを1段上げる")
         case .lowerHeadings: return L("すべての見出しを1段下げる")
         case .findReplace: return L("検索と置換…")
@@ -200,7 +200,7 @@ enum FormatAction: CaseIterable {
         case .insertTableOfContents: store.insertTableOfContents(levels: MarkdownStore.storedLevels)
         case .markdownToText: store.beginTextConversion()
         case .plainMarkdown: store.convertHTMLToMarkdown()
-        case .editThemes: SettingsWindow.shared.show(tab: L("テーマ"))
+        case .editThemes: SettingsWindow.shared.show(tab: L("変換・装飾"))
         case .copyHTML: store.copyHTML()
         case .bold: store.format(title) { MarkdownFormat.toggleWrap($0, selection: $1, marker: "**") }
         case .italic: store.format(title) { MarkdownFormat.toggleWrap($0, selection: $1, marker: "*") }
@@ -305,15 +305,17 @@ private final class FormatMenuTarget: NSObject {
 struct FormatMenuCommands: Commands {
     var body: some Commands {
         CommandMenu(L("書式")) {
-            ForEach(Array(FormatAction.groups.enumerated()), id: \.offset) { index, group in
-                if index > 0 { Divider() }
-                // Headings 1–6 and Paragraph sit directly in the menu (the context menu keeps 変換 as a submenu).
-                items(group)
-            }
+            FormatMenuItems()
         }
     }
+}
 
-    @ViewBuilder private func items(_ group: [FormatAction]) -> some View {
-        ForEach(group, id: \.self) { action in ShortcutButton(action: action) }
+/// Shared by the menu bar and the manuscript toolbar.
+struct FormatMenuItems: View {
+    var body: some View {
+        ForEach(Array(FormatAction.groups.enumerated()), id: \.offset) { index, group in
+            if index > 0 { Divider() }
+            ForEach(group, id: \.self) { action in ShortcutButton(action: action) }
+        }
     }
 }

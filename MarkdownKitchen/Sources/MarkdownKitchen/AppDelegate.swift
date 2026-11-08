@@ -3,13 +3,21 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // Single main window: no tab items in the Window/View menus.
+        StartupWindow.captureLaunch()
+        DocumentOpenEvents.shared.install { urls in
+            StartupWindow.userRequestedWindow()
+            MarkdownStore.open(urls, from: MarkdownStore.shared)
+        }
+        MarkdownStore.prepareRestoredDocuments()
+        // Document windows: no tab items in the Window/View menus.
         NSWindow.allowsAutomaticWindowTabbing = false
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
+        StartupWindow.captureLaunch()
         FormatAction.installHiddenKeys()
         startSettingsSync()
         DispatchQueue.main.async { [weak self] in
+            if !StartupWindow.suppressInitialWindow { MainWindow.show() }
             MenuBarPresence.shared.install(name: "MarkdownKitchen", symbol: "number",
                 show: { self?.showWindow() },
                 settings: { self?.showSettings() },
@@ -55,15 +63,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MarkdownStore.prepareToQuit() ? .terminateNow : .terminateCancel
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        StartupWindow.userRequestedWindow()
         showWindow()
         // showWindow() already reopens the main window; avoid SwiftUI opening a second one.
         return false
     }
     /// Markdown files dropped on the Dock icon or opened with "Open With" go to a blank window or a new window.
     func application(_ application: NSApplication, open urls: [URL]) {
+        StartupWindow.userRequestedWindow()
         MarkdownStore.open(urls, from: MarkdownStore.shared)
         application.reply(toOpenOrPrint: .success)
     }
     @objc func showWindow() { MainWindow.show() }
-    @objc func showSettings() { SettingsWindow.shared.show() }
+    @objc func showSettings() { AppSwitcherWindowReveal.preserveAuxiliaryWindowOnActivation(); SettingsWindow.shared.show() }
 }

@@ -37,6 +37,32 @@ final class MarkdownStore: ObservableObject {
         return store
     }
 
+    private static var preparedRestoration = false
+
+    /// Load saved document identities before routing the first Finder open event.
+    static func prepareRestoredDocuments() {
+        guard !preparedRestoration else { return }
+        preparedRestoration = true
+        let ids = UserDefaults.standard.stringArray(forKey: documentIDsKey) ?? []
+        var owners: [MarkdownStore] = [main]
+        for id in ids where !id.isEmpty {
+            let store = document(id)
+            if let url = store.fileURL,
+               let owner = owners.first(where: { $0.fileURL.map { DocumentFileIdentity.matches($0, url) } ?? false }) {
+                if !store.isEdited && !owner.isEdited && store.text == owner.text {
+                    // Only identical, saved restoration copies can be consolidated.
+                    discardDocument(id)
+                    continue
+                }
+                // Preserve a divergent/unsaved draft, but do not give two editors the same save target.
+                store.unlinkFile()
+                store.isEdited = true
+                UserDefaults.standard.set(true, forKey: store.key(editedKey))
+            }
+            owners.append(store)
+        }
+    }
+
     /// 終了中（閉じるウインドウの原稿を残し、次回開き直す）
     static var isTerminating = false
 
@@ -155,7 +181,10 @@ final class MarkdownStore: ObservableObject {
     @Published private(set) var allHeadings: [Heading]
     /// 読み込んだ（保存した）ファイル。⌘Sの上書き先。再起動しても覚えておく
     @Published private(set) var fileURL: URL? {
-        didSet { UserDefaults.standard.set(fileURL?.path, forKey: key(Self.fileKey)) }
+        didSet {
+            UserDefaults.standard.set(fileURL?.path, forKey: key(Self.fileKey))
+            refreshDocumentEdited()
+        }
     }
     var fileName: String? { fileURL?.lastPathComponent }
     /// 読み込み・保存のあとに原稿を変えたか
@@ -163,14 +192,17 @@ final class MarkdownStore: ObservableObject {
         didSet { refreshDocumentEdited() }
     }
 
-    /// 閉じるボタンの点（未保存の印）。読み込んだファイルがあるときだけ
+    /// ウインドウ一覧の書類名と閉じるボタンの未保存表示を同期する
     func refreshDocumentEdited() {
-        window?.isDocumentEdited = isEdited && fileURL != nil
+        window?.isDocumentEdited = isEdited
+        window?.title = fileName ?? L("名称未設定")
     }
     /// 読み込んだときの文字コード。保存も同じ文字コードで書く
     private var fileEncoding: String.Encoding = .utf8
     /// 読み込み・保存した時点のファイルの更新日時。ほかで書き換えられたかの判定に使う
     private var fileDate: Date?
+    private var ignoredExternalDate: Date?
+    private var checkingExternalChange = false
     static let fileKey = "markdownKitchen.filePath"
     static let editedKey = "markdownKitchen.fileEdited"
 
@@ -193,6 +225,7 @@ final class MarkdownStore: ObservableObject {
     weak var editor: NSTextView?
     /// 原稿のスクロール（いちばん上に見えている行、末尾なら .infinity）をプレビューへ伝える
     var onSourceScroll: ((Double) -> Void)?
+    var sourceScrollOwner: UUID?
 
     private init(id: String) {
         self.id = id
@@ -236,21 +269,22 @@ final class MarkdownStore: ObservableObject {
     /// ファイルを開く。開いているファイルならそのウインドウを前に出し、
     /// target が空ならそこへ、そうでなければ新規ウインドウに読み込む（ほかの原稿は置き換えない）
     static func open(_ urls: [URL], from target: MarkdownStore) {
+        prepareRestoredDocuments()
         var target = target
         for url in urls {
-            let path = url.standardizedFileURL.path
-            if let opened = ([main] + documents.values).first(where: { $0.fileURL?.standardizedFileURL.path == path }) {
+            if let opened = ([main] + documents.values).first(where: { $0.fileURL.map { DocumentFileIdentity.matches($0, url) } ?? false }) {
+                RecentFiles.shared.record(url)
                 opened.bringWindowForward()
                 continue
             }
-            if target.isBlank || MainWindow.openWithID == nil {
+            if target.isBlank {
                 target.load(url)
                 target.bringWindowForward()
             } else {
                 let id = UUID().uuidString
                 let store = document(id)
                 store.load(url)
-                MainWindow.openWithID?(id)
+                store.bringWindowForward()
                 target = store
             }
         }
@@ -276,6 +310,8 @@ final class MarkdownStore: ObservableObject {
         fileURL = url
         fileEncoding = encoding
         fileDate = Self.modificationDate(url)
+        ignoredExternalDate = nil
+        RecentFiles.shared.record(url)
         markSaved()
         message = nil
     }
@@ -295,7 +331,7 @@ final class MarkdownStore: ObservableObject {
 
     /// 未保存の変更があれば保存するか確かめる。続けてよければ true
     private func confirmDiscard(_ detail: String) -> Bool {
-        guard isEdited && !text.isEmpty else { return true }
+        guard isEdited else { return true }
         let alert = NSAlert()
         alert.messageText = fileName.map { L("「%@」への変更を保存しますか？", $0) } ?? L("原稿への変更を保存しますか？")
         alert.informativeText = detail
@@ -356,7 +392,7 @@ final class MarkdownStore: ObservableObject {
     func save() {
         guard let url = fileURL else { saveAs(); return }
         // Another app changed the file after it was loaded: ask before overwriting.
-        if let loadedDate = fileDate, let current = Self.modificationDate(url), current > loadedDate.addingTimeInterval(1) {
+        if let loadedDate = fileDate, let current = Self.modificationDate(url), current != loadedDate {
             let alert = NSAlert()
             alert.messageText = L("「%@」はほかのアプリで変更されています", url.lastPathComponent)
             alert.informativeText = L("上書きすると、ほかのアプリでの変更は失われます（上書き前の内容はアプリ内に控えます）。")
@@ -371,6 +407,28 @@ final class MarkdownStore: ObservableObject {
         write(to: url, encoding: fileEncoding)
     }
 
+    /// Check when returning from another app. Keeping the draft never acknowledges
+    /// the disk version for saving: save() still asks before overwriting it.
+    func checkExternalChanges() {
+        guard !checkingExternalChange, window?.isKeyWindow == true,
+              window?.attachedSheet == nil, NSApp.modalWindow == nil,
+              let url = fileURL, let previous = fileDate,
+              let current = Self.modificationDate(url), current != previous,
+              current != ignoredExternalDate else { return }
+        checkingExternalChange = true
+        defer { checkingExternalChange = false }
+        let alert = NSAlert()
+        alert.messageText = L("「%@」はほかのアプリで変更されています", url.lastPathComponent)
+        alert.informativeText = L("再読み込みすると現在の原稿をファイルの内容に置き換えます。編集中の内容を残す場合は「今の原稿を保持」を選んでください。")
+        alert.addButton(withTitle: L("今の原稿を保持"))
+        alert.addButton(withTitle: L("再読み込み"))
+        if alert.runModal() == .alertSecondButtonReturn {
+            load(url)
+        } else {
+            ignoredExternalDate = current
+        }
+    }
+
     /// 保存先を選んで書き出す。以後の⌘Sはそのファイルに上書き
     func saveAs() {
         let panel = NSSavePanel()
@@ -382,6 +440,18 @@ final class MarkdownStore: ObservableObject {
         panel.canCreateDirectories = true
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        Self.prepareRestoredDocuments()
+        if let owner = ([Self.main] + Self.documents.values).first(where: {
+            $0 !== self && ($0.fileURL.map { DocumentFileIdentity.matches($0, url) } ?? false)
+        }) {
+            let alert = NSAlert()
+            alert.messageText = L("このファイルは別のウインドウで開かれています")
+            alert.informativeText = L("上書きせず、開いているウインドウを表示します。現在の原稿はそのまま残ります。")
+            alert.addButton(withTitle: L("開いているウインドウを表示"))
+            alert.addButton(withTitle: L("キャンセル"))
+            if alert.runModal() == .alertFirstButtonReturn { owner.bringWindowForward() }
+            return
+        }
         // Keep the encoding only when overwriting the same file; a new file is UTF-8.
         write(to: url, encoding: url == fileURL ? fileEncoding : .utf8)
     }
@@ -401,6 +471,8 @@ final class MarkdownStore: ObservableObject {
         fileURL = url
         fileEncoding = encoding
         fileDate = Self.modificationDate(url)
+        ignoredExternalDate = nil
+        RecentFiles.shared.record(url)
         markSaved()
         message = L("保存しました：%@", url.lastPathComponent)
     }
@@ -583,12 +655,7 @@ final class MarkdownStore: ObservableObject {
 
     /// この原稿のウインドウを前に出す（しまっていれば戻す。メインウインドウは閉じていれば開き直す）
     func bringWindowForward() {
-        if isMain {
-            if window.map({ !$0.isVisible || $0.isMiniaturized }) ?? true { MainWindow.show() }
-        } else if let window {
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
-        }
+        MainWindow.showDocument(id)
     }
 
     /// 検索・置換からの置き換え（Undoに残す）
